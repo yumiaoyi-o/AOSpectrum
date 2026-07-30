@@ -1,0 +1,11 @@
+{
+  "schema": "aospectrum.kpath/v1",
+  "nodes_fractional": [
+    [0.0, 0.5, 0.0],
+    [0.0, 0.0, 0.0],
+    [0.5, 0.0, 0.0],
+    [0.5, 0.5, 0.0]
+  ],
+  "labels": ["Y", "G", "X", "M"],
+  "points_per_segment": 40
+}

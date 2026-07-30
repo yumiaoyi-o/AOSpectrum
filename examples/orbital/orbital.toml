@@ -1,0 +1,24 @@
+[input]
+bundle = "system.aobundle"
+
+[orbital]
+states = "VBM-5:CBM+10"
+kpoint = [0.0, 0.0, 0.0]
+grid_spacing_angstrom = 0.18
+energy_hint_ev = 0.0
+
+[basis]
+definition = "openmx-basis.toml"
+
+[compute]
+device = 0
+
+[resources]
+chunk_points = 65536
+
+[viewer]
+default_representation = "phase"
+enclosed_probability = 0.80
+
+[output]
+directory = "orbital-result"

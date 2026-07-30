@@ -1,0 +1,16 @@
+[input]
+bundle = "system.aobundle"
+
+[band]
+kpath = "YGXM-121.json"
+energy_interval_ev = [-0.6, 0.6]
+energy_reference = "input_zero"
+
+[compute]
+devices = [0]
+
+[resources]
+contour_batch_size = 1
+
+[output]
+directory = "band-result"

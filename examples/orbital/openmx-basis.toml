@@ -1,0 +1,4 @@
+basis_identity = "replace-with-bundle-basis-identity"
+
+[pao_files]
+"15" = "P8.0-s3p3d2.pao"

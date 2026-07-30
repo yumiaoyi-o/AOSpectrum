@@ -1,0 +1,72 @@
+[build-system]
+requires = [
+  "scikit-build-core>=0.10",
+  "pybind11>=2.12",
+  "numpy>=1.26",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "aospectrum"
+version = "1.0.0rc1"
+description = "Sparse band and orbital tools for localized atomic-orbital Hamiltonians."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [
+  { name = "Tang Hanqiao" },
+]
+dependencies = [
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+  "scipy>=1.10",
+  "tomli>=2; python_version < '3.11'",
+]
+keywords = [
+  "electronic-structure",
+  "localized-orbitals",
+  "sparse-eigensolver",
+  "band-structure",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.optional-dependencies]
+orbital = [
+  "torch>=2.2",
+]
+
+[project.scripts]
+aospectrum = "aospectrum.cli.main:main"
+
+[project.urls]
+Repository = "https://github.com/yumiaoyi-o/AOSpectrum"
+Issues = "https://github.com/yumiaoyi-o/AOSpectrum/issues"
+
+[tool.scikit-build]
+cmake.version = ">=3.20"
+wheel.packages = ["src/aospectrum"]
+sdist.include = [
+  "CMakeLists.txt",
+  "native/CMakeLists.txt",
+  "native/include/*.h",
+  "native/src/*.c",
+  "native/src/*.cpp",
+  "src/aospectrum/**/*.py",
+  "src/aospectrum/assets/*.js",
+  "src/aospectrum/assets/*.txt",
+  "examples/**/*.json",
+  "examples/**/*.toml",
+  "examples/**/*.sbatch",
+  "scripts/*.sh",
+  "README.md",
+  "LICENSE",
+  "THIRD_PARTY_NOTICES.md",
+]
