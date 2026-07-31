@@ -44,7 +44,7 @@ orbital = [
 ]
 
 [project.scripts]
-aospectrum = "aospectrum.cli.main:main"
+aospectrum = "aospectrum.cli:main"
 
 [project.urls]
 Repository = "https://github.com/yumiaoyi-o/AOSpectrum"

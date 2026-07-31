@@ -9,7 +9,7 @@ energy_reference = "input_zero"
 [compute]
 devices = [0]
 
-[resources]
+[solver]
 contour_batch_size = 1
 
 [output]

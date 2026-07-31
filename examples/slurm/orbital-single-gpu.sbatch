@@ -15,6 +15,6 @@ export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 
 # The Orbital TOML should use device = 0.
-srun aospectrum orbital --config orbital.toml
+srun aospectrum orbital orbital.toml
 # To continue the exact interrupted eigensystem and state fields:
-# srun aospectrum orbital --config orbital.toml --resume
+# srun aospectrum orbital orbital.toml --resume

@@ -13,16 +13,19 @@ from uuid import uuid4
 
 import numpy as np
 
-from aospectrum.errors import AOSpectrumError, ArtifactError
-from aospectrum.model.structure import AtomicStructure
-from aospectrum.orbital.model import OrbitalEigensystem, OrbitalStateField
-from aospectrum.orbital.volume import enclosed_probability_levels
+from .data import AtomicStructure
+from .errors import AOSpectrumError, InputError, SolverError
+from .orbital import (
+    OrbitalEigensystem,
+    OrbitalStateField,
+    enclosed_probability_levels,
+)
 
 
 VIEWER_SCHEMA = "aospectrum.orbital-viewer/v1"
 
 
-def _json_value(value: Any) -> Any:
+def _json_value(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, np.generic):
@@ -37,7 +40,7 @@ def _json_value(value: Any) -> Any:
     return value
 
 
-def _write_json(path: Path, value: Any) -> None:
+def _write_json(path: Path, value) -> None:
     path.write_text(
         json.dumps(
             _json_value(value),
@@ -51,7 +54,7 @@ def _write_json(path: Path, value: Any) -> None:
     )
 
 
-def _matrix_rows(field: Any) -> list[list[float]]:
+def _matrix_rows(field) -> list[list[float]]:
     nx, ny, nz = field.grid_shape
     a, b, c = field.cell_angstrom
     origin = field.origin_angstrom
@@ -65,53 +68,7 @@ def _matrix_rows(field: Any) -> list[list[float]]:
 
 def _write_f32(path: Path, values: np.ndarray) -> None:
     shaped = np.asarray(values, dtype=np.dtype("<f4"))
-    path.write_bytes(np.asfortranarray(shaped).tobytes(order="F"))
-
-
-def _solver_record(eigensystem: OrbitalEigensystem) -> dict[str, Any]:
-    receipt = eigensystem.receipt
-    quality = eigensystem.quality
-    return {
-        "schema": "aospectrum.orbital-result/v1",
-        "backend": eigensystem.backend,
-        "selection": {
-            "expression": eigensystem.selection.expression,
-            "semantics": eigensystem.selection.semantics,
-            "first": eigensystem.selection.absolute.first,
-            "last": eigensystem.selection.absolute.last,
-        },
-        "quality": {
-            "status": quality.status,
-            "warnings": list(quality.warnings),
-            "policy": {
-                "name": quality.policy.name,
-                "raw_residual_tolerance_ev": (
-                    quality.policy.raw_residual_tolerance_ev
-                ),
-                "normalized_residual_tolerance": (
-                    quality.policy.normalized_residual_tolerance
-                ),
-                "s_orthogonality_tolerance": (
-                    quality.policy.s_orthogonality_tolerance
-                ),
-            },
-            "s_orthogonality_error": quality.s_orthogonality_error,
-            "calculation_dtype": quality.calculation_dtype,
-        },
-        "receipt": {
-            "backend": receipt.backend,
-            "device": receipt.device,
-            "scalar_dtype": receipt.scalar_dtype,
-            "stage_seconds": dict(receipt.stage_seconds),
-            "peak_host_rss_bytes": receipt.peak_host_rss_bytes,
-            "peak_gpu_memory_bytes": receipt.peak_gpu_memory_bytes,
-            "counters": dict(receipt.counters),
-            "details": dict(receipt.details),
-        },
-        "locator_evidence": dict(eigensystem.locator_evidence),
-        "degeneracy_notices": list(eigensystem.degeneracy_notices),
-        "metadata": dict(eigensystem.metadata),
-    }
+    np.asfortranarray(shaped).ravel(order="F").tofile(path)
 
 
 def write_orbital_viewer(
@@ -129,21 +86,21 @@ def write_orbital_viewer(
         not math.isfinite(default_probability)
         or not 0.50 <= default_probability <= 0.99
     ):
-        raise ArtifactError(
+        raise InputError(
             "default enclosed probability must be between 0.50 and 0.99"
         )
     if default_representation not in {"phase", "density"}:
-        raise ArtifactError(
+        raise InputError(
             "default representation must be 'phase' or 'density'"
         )
     root = Path(destination)
     if root.exists():
         if not root.is_dir():
-            raise ArtifactError(
+            raise InputError(
                 f"Orbital destination is not a directory: {root}"
             )
         if any(root.iterdir()):
-            raise ArtifactError(
+            raise InputError(
                 f"Orbital destination is not empty: {root}"
             )
     temporary_root = root.with_name(f".{root.name}.tmp-{uuid4().hex}")
@@ -151,7 +108,7 @@ def write_orbital_viewer(
     assets_root = temporary_root / "assets"
     states_root.mkdir(parents=True, exist_ok=True)
     assets_root.mkdir(parents=True, exist_ok=True)
-    expected_states = eigensystem.absolute_state_numbers.tolist()
+    expected_states = eigensystem.state_numbers.tolist()
     records: list[dict[str, Any]] = []
     observed: list[int] = []
     try:
@@ -178,7 +135,7 @@ def write_orbital_viewer(
                 ),
                 "captured_norm": levels.captured_norm,
                 "compute_device": state_field.field.compute_device,
-                "field_precision": state_field.field.precision,
+                "field_precision": "complex64",
                 "isovalue_mode": "enclosed_probability",
                 "probabilities": levels.probabilities.tolist(),
                 "amplitude_levels": levels.amplitude_levels.tolist(),
@@ -193,53 +150,44 @@ def write_orbital_viewer(
                     "state_number": state,
                     "label": state_field.label,
                     "energy_ev": state_field.energy_ev,
+                    "evaluation_seconds": state_field.evaluation_seconds,
                     "metadata": f"states/{state_id}/metadata.json",
                     "phase": f"states/{state_id}/phase.f32",
                     "density": f"states/{state_id}/density.f32",
                 }
             )
         if observed != expected_states:
-            raise ArtifactError(
+            raise SolverError(
                 "Orbital fields do not exactly cover selected states in order"
             )
-        np.savez(
-            temporary_root / "eigensystem.npz",
-            absolute_state_numbers=eigensystem.absolute_state_numbers,
-            energies_ev=eigensystem.energies_ev,
-            eigenvectors=eigensystem.eigenvectors,
-            phase_anchor_indices=eigensystem.phase_anchor_indices,
-            raw_residuals_ev=eigensystem.quality.raw_residuals_ev,
-            normalized_residuals=eigensystem.quality.normalized_residuals,
-        )
-        solver_record = _solver_record(eigensystem)
-        warnings = list(eigensystem.degeneracy_notices)
-        if not all(structure.periodic):
-            warnings.append(
-                "non-periodic axes are outside the validated v1 scope; "
-                "rendered orbital images may be inaccurate"
-            )
-        solver_record["warnings"] = warnings
-        _write_json(temporary_root / "manifest.json", solver_record)
-        _write_json(
-            temporary_root / "quality.json",
-            {
-                "schema": "aospectrum.orbital-quality/v1",
-                **solver_record["quality"],
-            },
-        )
-        _write_json(
-            temporary_root / "receipt.json",
-            {
-                "schema": "aospectrum.orbital-receipt/v1",
-                **solver_record["receipt"],
-            },
-        )
         _write_json(
             temporary_root / "viewer-manifest.json",
             {
                 "schema": VIEWER_SCHEMA,
                 "default_probability": float(default_probability),
                 "default_representation": default_representation,
+                "calculation": {
+                    "backend": "primme-cudss",
+                    "scalar_dtype": "float32",
+                    "selection": {
+                        "expression": eigensystem.selection.expression,
+                        "semantics": eigensystem.selection.semantics,
+                        "first": eigensystem.selection.states.first,
+                        "last": eigensystem.selection.states.last,
+                    },
+                    "maximum_eigenpair_residual_ev": (
+                        eigensystem.maximum_residual_ev
+                    ),
+                    "stage_seconds": eigensystem.stage_seconds,
+                    "peak_gpu_memory_bytes": (
+                        eigensystem.peak_gpu_memory_bytes
+                    ),
+                    "field_evaluation_seconds": sum(
+                        record["evaluation_seconds"]
+                        for record in records
+                    ),
+                    "warnings": list(eigensystem.warnings),
+                },
                 "structure": {
                     "positions_angstrom": (
                         structure.positions_angstrom.tolist()
@@ -249,7 +197,6 @@ def write_orbital_viewer(
                     "origin_angstrom": [0.0, 0.0, 0.0],
                     "periodic": list(structure.periodic),
                 },
-                "warnings": warnings,
                 "states": records,
             },
         )
@@ -266,14 +213,14 @@ def write_orbital_viewer(
         shutil.rmtree(temporary_root, ignore_errors=True)
         if isinstance(exc, AOSpectrumError):
             raise
-        raise ArtifactError(f"cannot write Orbital viewer {root}: {exc}") from exc
+        raise SolverError(f"cannot write Orbital viewer {root}: {exc}") from exc
     try:
         if root.exists():
             root.rmdir()
         os.replace(temporary_root, root)
     except OSError as exc:
         shutil.rmtree(temporary_root, ignore_errors=True)
-        raise ArtifactError(f"cannot publish Orbital viewer {root}: {exc}") from exc
+        raise SolverError(f"cannot publish Orbital viewer {root}: {exc}") from exc
     return root
 
 
@@ -442,7 +389,10 @@ def _viewer_html() -> str:
     densitySurface = makeVolume("Density", density).addRepresentation(
       "surface", surfaceParameters(metadata.density_levels[index], "#168a61")
     );
-    addStructure(); applyRepresentation();
+    addStructure();
+    atomRepresentation.setVisibility(document.getElementById("atoms").checked);
+    cellRepresentation.setVisibility(document.getElementById("cell").checked);
+    applyRepresentation();
     subtitle.textContent = `${state.label} | state ${state.state_number} | ` +
       `${Number(state.energy_ev).toFixed(6)} eV | ${metadata.grid.join(" x ")} | ` +
       `captured grid norm ${Number(metadata.captured_norm).toFixed(5)}`;

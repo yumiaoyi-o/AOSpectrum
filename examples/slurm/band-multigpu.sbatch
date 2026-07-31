@@ -20,6 +20,6 @@ export OPENBLAS_NUM_THREADS="${THREADS_PER_WORKER}"
 export MKL_NUM_THREADS="${THREADS_PER_WORKER}"
 
 # The Band TOML should list logical devices [0, 1, ..., 7].
-srun aospectrum band --config band.toml
+srun aospectrum band band.toml
 # To continue the exact interrupted run:
-# srun aospectrum band --config band.toml --resume
+# srun aospectrum band band.toml --resume

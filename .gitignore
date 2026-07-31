@@ -12,4 +12,5 @@ wheelhouse/
 cmake-build-*/
 band-result/
 orbital-result/
-
+.*.work/
+.*.publish/

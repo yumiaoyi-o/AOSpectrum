@@ -1,4 +1,4 @@
-"""OpenMX-compatible cubic interpolation for PAO radial functions."""
+"""OpenMX cubic interpolation for PAO radial functions."""
 
 from __future__ import annotations
 

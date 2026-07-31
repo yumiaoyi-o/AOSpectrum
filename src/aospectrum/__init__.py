@@ -1,13 +1,13 @@
-"""Sparse band and orbital tools for localized atomic-orbital models."""
+"""Sparse Band and Orbital tools for localized atomic-orbital models."""
 
-from .io.bundle import load_bundle, write_bundle
-from .model.basis import OrbitalBasisLayout
-from .model.operators import (
+from .bundle import load_bundle, write_bundle
+from .data import (
+    AtomicStructure,
     ElectronicFilling,
     LocalizedOperatorBlocks,
     LocalizedOperatorBundle,
+    OrbitalBasisLayout,
 )
-from .model.structure import AtomicStructure
 
 __all__ = [
     "AtomicStructure",

@@ -5,18 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import product
 import math
-from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 
-from aospectrum.errors import FieldError
-from aospectrum.model.basis import OrbitalBasisLayout
-from aospectrum.model.structure import AtomicStructure
-from aospectrum.orbital.model import GridSpec
-from aospectrum.orbital.providers.base import FieldResources, OrbitalField
-from aospectrum.orbital.providers.openmx_pao_data import OpenMXPAOData
-from aospectrum.orbital.providers.openmx_radial import OpenMXRadialSpline
+from .data import AtomicStructure, OrbitalBasisLayout
+from .errors import InputError, SolverError
+from .openmx_data import OpenMXPAOData
+from .openmx_radial import OpenMXRadialSpline
+from .orbital import FieldResources, GridSpec, OrbitalField
 
 
 ANGSTROM_TO_BOHR = 1.889_726_125_457_828_1
@@ -24,14 +21,14 @@ ANGSTROM_TO_BOHR = 1.889_726_125_457_828_1
 
 @dataclass(frozen=True, slots=True)
 class OpenMXPAOProvider:
-    """Evaluate a basis whose coefficient descriptors use OpenMX ordering."""
+    """Expand complex64 AO coefficients with OpenMX PAO basis functions."""
 
     basis_identity: str
-    pao_by_atomic_number: Mapping[int, OpenMXPAOData]
+    pao_by_atomic_number: dict[int, OpenMXPAOData]
 
     def __post_init__(self) -> None:
         if not isinstance(self.basis_identity, str) or not self.basis_identity:
-            raise FieldError("OpenMX provider basis_identity must not be empty")
+            raise InputError("OpenMX provider basis_identity must not be empty")
         normalized: dict[int, OpenMXPAOData] = {}
         for atomic_number, pao in self.pao_by_atomic_number.items():
             if (
@@ -39,15 +36,11 @@ class OpenMXPAOProvider:
                 or int(atomic_number) <= 0
                 or not isinstance(pao, OpenMXPAOData)
             ):
-                raise FieldError("OpenMX PAO mapping is invalid")
+                raise InputError("OpenMX PAO mapping is invalid")
             normalized[int(atomic_number)] = pao
         if not normalized:
-            raise FieldError("OpenMX provider requires at least one PAO")
-        object.__setattr__(
-            self,
-            "pao_by_atomic_number",
-            MappingProxyType(normalized),
-        )
+            raise InputError("OpenMX provider requires at least one PAO")
+        object.__setattr__(self, "pao_by_atomic_number", normalized)
 
     def evaluate_orbital(
         self,
@@ -56,38 +49,27 @@ class OpenMXPAOProvider:
         coefficients: np.ndarray,
         grid: GridSpec,
         resources: FieldResources,
-        *,
-        precision: str,
     ) -> OrbitalField:
         if layout.basis_identity != self.basis_identity:
-            raise FieldError("basis provider identity differs from AO layout")
-        if layout.spinor_width != 1:
-            raise FieldError("v1 OpenMX field provider does not render spinors")
+            raise InputError("basis provider identity differs from AO layout")
         if not layout.has_real_space_descriptors:
-            raise FieldError(
+            raise InputError(
                 "OpenMX field evaluation requires l/radial/harmonic descriptors"
             )
-        expected = (
-            np.dtype(np.complex64)
-            if precision == "float32"
-            else np.dtype(np.complex128)
-        )
-        values = np.asarray(coefficients)
-        if values.shape != (layout.n_orbitals,) or values.dtype != expected:
-            raise FieldError(
-                "Orbital coefficients differ from layout or requested precision"
-            )
+        values = np.asarray(coefficients, dtype=np.complex64)
+        if values.shape != (layout.n_orbitals,):
+            raise InputError("Orbital coefficients differ from the AO layout")
         if not np.all(np.isfinite(values)):
-            raise FieldError("Orbital coefficients must be finite")
+            raise InputError("Orbital coefficients must be finite")
         for atomic_number in np.unique(structure.atomic_numbers):
             if int(atomic_number) not in self.pao_by_atomic_number:
-                raise FieldError(
+                raise InputError(
                     f"OpenMX provider has no PAO for Z={int(atomic_number)}"
                 )
         try:
             import torch
         except (ImportError, OSError) as exc:
-            raise FieldError(
+            raise InputError(
                 "OpenMX field evaluation requires the optional torch dependency"
             ) from exc
         try:
@@ -98,15 +80,14 @@ class OpenMXPAOProvider:
                 values,
                 grid.resolve_shape(structure.cell_angstrom),
                 resources,
-                precision,
                 torch,
                 device,
                 device_label,
             )
-        except FieldError:
+        except (InputError, SolverError):
             raise
         except RuntimeError as exc:
-            raise FieldError(
+            raise SolverError(
                 f"OpenMX field evaluation failed on {resources.device}: {exc}"
             ) from exc
 
@@ -117,17 +98,14 @@ class OpenMXPAOProvider:
         coefficients: np.ndarray,
         grid_shape: tuple[int, int, int],
         resources: FieldResources,
-        precision: str,
         torch: Any,
         device: Any,
         device_label: str,
     ) -> OrbitalField:
-        real_numpy = np.float32 if precision == "float32" else np.float64
-        complex_numpy = np.complex64 if precision == "float32" else np.complex128
-        real_torch = torch.float32 if precision == "float32" else torch.float64
-        complex_torch = (
-            torch.complex64 if precision == "float32" else torch.complex128
-        )
+        real_numpy = np.float32
+        complex_numpy = np.complex64
+        real_torch = torch.float32
+        complex_torch = torch.complex64
         prepared = self._prepare_radials(
             structure,
             layout,
@@ -237,7 +215,6 @@ class OpenMXPAOProvider:
             origin_angstrom=np.zeros(3, dtype=np.float64),
             voxel_volume_bohr3=voxel_volume_bohr3,
             compute_device=device_label,
-            precision=precision,
         )
 
     def _prepare_radials(
@@ -290,16 +267,16 @@ def _resolve_device(requested: str, torch: Any) -> tuple[Any, str]:
     try:
         device = torch.device(requested)
     except (RuntimeError, ValueError) as exc:
-        raise FieldError(f"invalid field device {requested!r}") from exc
+        raise InputError(f"invalid field device {requested!r}") from exc
     if device.type == "cpu":
         if device.index is not None:
-            raise FieldError("CPU field device must not include an index")
+            raise InputError("CPU field device must not include an index")
         return torch.device("cpu"), "cpu"
     if device.type != "cuda" or not torch.cuda.is_available():
-        raise FieldError(f"CUDA field device is unavailable: {requested}")
+        raise InputError(f"CUDA field device is unavailable: {requested}")
     index = torch.cuda.current_device() if device.index is None else device.index
     if index < 0 or index >= torch.cuda.device_count():
-        raise FieldError(f"CUDA field device index is invalid: {index}")
+        raise InputError(f"CUDA field device index is invalid: {index}")
     torch.cuda.set_device(index)
     resolved = torch.device(f"cuda:{index}")
     return resolved, str(resolved)
@@ -355,7 +332,7 @@ def _translation_indices(
 
 def _comp2real_matrix(l_value: int) -> np.ndarray:
     dimension = 2 * l_value + 1
-    matrix = np.zeros((dimension, dimension), dtype=np.complex128)
+    matrix = np.zeros((dimension, dimension), dtype=np.complex64)
     if l_value == 0:
         matrix[0, 0] = 1.0
         return matrix
@@ -465,9 +442,7 @@ def _real_harmonics(
         2.0 * math.pi,
     )
     plm = _associated_legendre(l_value, cosine, real_dtype, torch)
-    complex_dtype = (
-        torch.complex64 if real_dtype == torch.float32 else torch.complex128
-    )
+    complex_dtype = torch.complex64
     exp_one = torch.exp(1j * phi.to(complex_dtype))
     exponentials = {
         0: torch.ones_like(exp_one),
