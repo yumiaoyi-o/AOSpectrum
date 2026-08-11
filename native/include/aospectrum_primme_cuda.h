@@ -53,6 +53,24 @@ typedef struct {
 typedef struct {
    uint32_t abi_version;
    uint32_t struct_size;
+   const float *device_hamiltonian_values;
+   const float *device_overlap_values;
+   uintptr_t producer_stream;
+   float hamiltonian_scale_to_hartree;
+} aospectrum_primme_cuda_device_values_request_v1;
+
+typedef struct {
+   uint32_t abi_version;
+   uint32_t struct_size;
+   float target_shift_hartree;
+   int32_t preconditioner_kind;
+   float diagonal_floor_hartree;
+   int32_t maximum_preconditioner_block_size;
+} aospectrum_primme_cuda_resident_factor_request_v1;
+
+typedef struct {
+   uint32_t abi_version;
+   uint32_t struct_size;
    uint64_t numeric_epoch;
    int32_t num_evals;
    int32_t target_mode;
@@ -139,6 +157,27 @@ int aospectrum_primme_cuda_real32_session_create_v1(
 int aospectrum_primme_cuda_real32_session_update_v1(
       aospectrum_primme_cuda_real32_session_v1 *session,
       const aospectrum_primme_cuda_numeric_update_request_v1 *request,
+      aospectrum_primme_cuda_result_v1 *result);
+
+/*
+ * Admit one frame's device-resident H/S values. The call orders against the
+ * producer stream, copies the values device-to-device into session-owned
+ * buffers, and synchronizes before returning so the borrowed source buffers
+ * may be released immediately.
+ */
+int aospectrum_primme_cuda_real32_session_load_device_values_v1(
+      aospectrum_primme_cuda_real32_session_v1 *session,
+      const aospectrum_primme_cuda_device_values_request_v1 *request,
+      aospectrum_primme_cuda_result_v1 *result);
+
+/*
+ * Factor a new shift from the resident H/S values. The first call creates the
+ * cuDSS symbolic analysis; later calls with the same session topology and
+ * block size reuse it and perform numerical factorization only.
+ */
+int aospectrum_primme_cuda_real32_session_factor_resident_v1(
+      aospectrum_primme_cuda_real32_session_v1 *session,
+      const aospectrum_primme_cuda_resident_factor_request_v1 *request,
       aospectrum_primme_cuda_result_v1 *result);
 
 /*

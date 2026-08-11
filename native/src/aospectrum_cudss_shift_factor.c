@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "aospectrum_cudss_shift_factor.h"
+#include "aospectrum_cuda_ops.h"
 
 #include <cudss.h>
 
@@ -18,11 +19,16 @@ struct aospectrum_cudss_shift_factor {
    cudaStream_t stream;
    int32_t *device_indptr;
    int32_t *device_indices;
+   int32_t *device_source_positions;
    float *device_values;
+   float *device_dummy_rhs;
+   float *device_dummy_solution;
    cudssHandle_t handle;
    cudssConfig_t config;
    cudssData_t data;
    cudssMatrix_t matrix;
+   cudssMatrix_t dummy_rhs;
+   cudssMatrix_t dummy_solution;
    aospectrum_cudss_shift_factor_stats stats;
 };
 
@@ -82,17 +88,14 @@ static int check_cudss(
    return 1;
 }
 
-static int prepare_upper_triangle(
+static int prepare_upper_pattern(
       int64_t n,
       int64_t nnz,
       const int32_t *indptr,
       const int32_t *indices,
-      const float *hamiltonian_values,
-      const float *overlap_values,
-      float shift_hartree,
       int32_t **upper_indptr,
       int32_t **upper_indices,
-      float **upper_values,
+      int32_t **source_positions,
       int64_t *upper_nnz,
       char *error_message,
       size_t error_capacity) {
@@ -159,15 +162,16 @@ static int prepare_upper_triangle(
    }
 
    int32_t *output_indices = malloc((size_t)count * sizeof(*output_indices));
-   float *output_values = malloc((size_t)count * sizeof(*output_values));
-   if (output_indices == NULL || output_values == NULL) {
-      free(output_values);
+   int32_t *output_positions = malloc(
+      (size_t)count * sizeof(*output_positions));
+   if (output_indices == NULL || output_positions == NULL) {
+      free(output_positions);
       free(output_indices);
       free(output_indptr);
       set_error(
          error_message,
          error_capacity,
-         "cannot allocate upper-triangle CSR values");
+         "cannot allocate upper-triangle CSR mapping");
       return 1;
    }
 
@@ -180,28 +184,15 @@ static int prepare_upper_triangle(
          if (column < row) {
             continue;
          }
-         const float value =
-            hamiltonian_values[position] -
-            shift_hartree * overlap_values[position];
-         if (!isfinite(value)) {
-            free(output_values);
-            free(output_indices);
-            free(output_indptr);
-            set_error(
-               error_message,
-               error_capacity,
-               "shifted matrix contains non-finite values");
-            return 1;
-         }
          output_indices[output] = column;
-         output_values[output] = value;
+         output_positions[output] = position;
          ++output;
       }
    }
 
    *upper_indptr = output_indptr;
    *upper_indices = output_indices;
-   *upper_values = output_values;
+   *source_positions = output_positions;
    *upper_nnz = count;
    return 0;
 }
@@ -238,14 +229,113 @@ static int query_data_info(
    return 0;
 }
 
-int aospectrum_cudss_shift_factor_create(
+static int factorize_current_values(
+      aospectrum_cudss_shift_factor *factor,
+      char *error_message,
+      size_t error_capacity) {
+   size_t free_bytes = 0;
+   size_t total_bytes = 0;
+   size_t bytes_written = 0;
+   int64_t factor_nnz = 0;
+   int32_t pivot_count = 0;
+   int32_t inertia[2] = {0, 0};
+
+   factor->stats.factorization_seconds = 0.0;
+   factor->stats.solve_seconds = 0.0;
+   factor->stats.solve_calls = 0;
+   factor->stats.solved_rhs = 0;
+   if (check_cuda(
+         cudaMemGetInfo(&free_bytes, &total_bytes),
+         error_message,
+         error_capacity,
+         "cudaMemGetInfo before factorization")) {
+      return 1;
+   }
+   factor->stats.free_device_bytes_before_factorization = free_bytes;
+
+   const double started = monotonic_seconds();
+   if (check_cudss(
+         cudssExecute(
+            factor->handle,
+            CUDSS_PHASE_FACTORIZATION,
+            factor->config,
+            factor->data,
+            factor->matrix,
+            factor->dummy_solution,
+            factor->dummy_rhs),
+         error_message,
+         error_capacity,
+         "cuDSS numerical factorization") ||
+       check_cuda(
+         cudaStreamSynchronize(factor->stream),
+         error_message,
+         error_capacity,
+         "cuDSS factorization synchronization") ||
+       query_data_info(
+         factor,
+         error_message,
+         error_capacity,
+         "cuDSS factorization")) {
+      return 1;
+   }
+   factor->stats.factorization_seconds = monotonic_seconds() - started;
+
+   if (check_cudss(
+         cudssDataGet(
+            factor->handle,
+            factor->data,
+            CUDSS_DATA_LU_NNZ,
+            &factor_nnz,
+            sizeof(factor_nnz),
+            &bytes_written),
+         error_message,
+         error_capacity,
+         "cuDSS factor-nnz query") ||
+       check_cudss(
+         cudssDataGet(
+            factor->handle,
+            factor->data,
+            CUDSS_DATA_NPIVOTS,
+            &pivot_count,
+            sizeof(pivot_count),
+            &bytes_written),
+         error_message,
+         error_capacity,
+         "cuDSS pivot-count query") ||
+       check_cudss(
+         cudssDataGet(
+            factor->handle,
+            factor->data,
+            CUDSS_DATA_INERTIA,
+            inertia,
+            sizeof(inertia),
+            &bytes_written),
+         error_message,
+         error_capacity,
+         "cuDSS inertia query") ||
+       check_cuda(
+         cudaMemGetInfo(&free_bytes, &total_bytes),
+         error_message,
+         error_capacity,
+         "cudaMemGetInfo after factorization")) {
+      return 1;
+   }
+   factor->stats.factor_nnz = factor_nnz;
+   factor->stats.pivot_count = pivot_count;
+   factor->stats.inertia_positive = inertia[0];
+   factor->stats.inertia_negative = inertia[1];
+   factor->stats.free_device_bytes_after_factorization = free_bytes;
+   return 0;
+}
+
+int aospectrum_cudss_shift_factor_create_device(
       aospectrum_cudss_shift_factor **factor_output,
       int64_t n,
       int64_t nnz,
       const int32_t *indptr,
       const int32_t *indices,
-      const float *hamiltonian_values,
-      const float *overlap_values,
+      const float *device_hamiltonian_values,
+      const float *device_overlap_values,
       float shift_hartree,
       int32_t maximum_rhs,
       cudaStream_t stream,
@@ -254,11 +344,7 @@ int aospectrum_cudss_shift_factor_create(
    int return_code = 1;
    int32_t *host_indptr = NULL;
    int32_t *host_indices = NULL;
-   float *host_values = NULL;
-   float *dummy_rhs_values = NULL;
-   float *dummy_solution_values = NULL;
-   cudssMatrix_t dummy_rhs = NULL;
-   cudssMatrix_t dummy_solution = NULL;
+   int32_t *host_source_positions = NULL;
    aospectrum_cudss_shift_factor *factor = NULL;
 
    if (factor_output == NULL) {
@@ -268,8 +354,8 @@ int aospectrum_cudss_shift_factor_create(
    *factor_output = NULL;
    if (n <= 0 || n > INT32_MAX || nnz <= 0 || nnz > INT32_MAX ||
          indptr == NULL || indices == NULL ||
-         hamiltonian_values == NULL || overlap_values == NULL ||
-         !isfinite(shift_hartree) ||
+         device_hamiltonian_values == NULL ||
+         device_overlap_values == NULL || !isfinite(shift_hartree) ||
          maximum_rhs <= 0 || maximum_rhs > 256) {
       set_error(error_message, error_capacity, "invalid shift-factor request");
       return 1;
@@ -292,34 +378,20 @@ int aospectrum_cudss_shift_factor_create(
    factor->stream = stream;
 
    double started = monotonic_seconds();
-   if (prepare_upper_triangle(
+   if (prepare_upper_pattern(
          n,
          nnz,
          indptr,
          indices,
-         hamiltonian_values,
-         overlap_values,
-         shift_hartree,
          &host_indptr,
          &host_indices,
-         &host_values,
+         &host_source_positions,
          &factor->stats.upper_nnz,
          error_message,
          error_capacity)) {
       goto cleanup;
    }
    factor->stats.preparation_seconds = monotonic_seconds() - started;
-
-   size_t free_bytes = 0;
-   size_t total_bytes = 0;
-   if (check_cuda(
-         cudaMemGetInfo(&free_bytes, &total_bytes),
-         error_message,
-         error_capacity,
-         "cudaMemGetInfo before factorization")) {
-      goto cleanup;
-   }
-   factor->stats.free_device_bytes_before_factorization = free_bytes;
 
    started = monotonic_seconds();
    if (check_cuda(
@@ -339,6 +411,14 @@ int aospectrum_cudss_shift_factor_create(
          "shifted column allocation") ||
        check_cuda(
          cudaMalloc(
+            (void **)&factor->device_source_positions,
+            (size_t)factor->stats.upper_nnz *
+               sizeof(*factor->device_source_positions)),
+         error_message,
+         error_capacity,
+         "shifted source-position allocation") ||
+       check_cuda(
+         cudaMalloc(
             (void **)&factor->device_values,
             (size_t)factor->stats.upper_nnz *
                sizeof(*factor->device_values)),
@@ -347,16 +427,17 @@ int aospectrum_cudss_shift_factor_create(
          "shifted value allocation") ||
        check_cuda(
          cudaMalloc(
-            (void **)&dummy_rhs_values,
-            (size_t)n * (size_t)maximum_rhs * sizeof(*dummy_rhs_values)),
+            (void **)&factor->device_dummy_rhs,
+            (size_t)n * (size_t)maximum_rhs *
+               sizeof(*factor->device_dummy_rhs)),
          error_message,
          error_capacity,
          "dummy rhs allocation") ||
        check_cuda(
          cudaMalloc(
-            (void **)&dummy_solution_values,
+            (void **)&factor->device_dummy_solution,
             (size_t)n * (size_t)maximum_rhs *
-               sizeof(*dummy_solution_values)),
+               sizeof(*factor->device_dummy_solution)),
          error_message,
          error_capacity,
          "dummy solution allocation") ||
@@ -383,15 +464,25 @@ int aospectrum_cudss_shift_factor_create(
          "shifted column upload") ||
        check_cuda(
          cudaMemcpyAsync(
-            factor->device_values,
-            host_values,
+            factor->device_source_positions,
+            host_source_positions,
             (size_t)factor->stats.upper_nnz *
-               sizeof(*factor->device_values),
+               sizeof(*factor->device_source_positions),
             cudaMemcpyHostToDevice,
             stream),
          error_message,
          error_capacity,
-         "shifted value upload") ||
+         "shifted source-position upload") ||
+       aospectrum_cuda_gather_shifted_real32(
+         device_hamiltonian_values,
+         device_overlap_values,
+         factor->device_source_positions,
+         factor->stats.upper_nnz,
+         shift_hartree,
+         factor->device_values,
+         stream,
+         error_message,
+         error_capacity) ||
        check_cuda(
          cudaStreamSynchronize(stream),
          error_message,
@@ -442,11 +533,11 @@ int aospectrum_cudss_shift_factor_create(
          "cuDSS shifted matrix creation") ||
        check_cudss(
          cudssMatrixCreateDn(
-            &dummy_rhs,
+            &factor->dummy_rhs,
             n,
             maximum_rhs,
             n,
-            dummy_rhs_values,
+            factor->device_dummy_rhs,
             CUDSS_R_32F,
             CUDSS_LAYOUT_COL_MAJOR),
          error_message,
@@ -454,11 +545,11 @@ int aospectrum_cudss_shift_factor_create(
          "cuDSS dummy rhs creation") ||
        check_cudss(
          cudssMatrixCreateDn(
-            &dummy_solution,
+            &factor->dummy_solution,
             n,
             maximum_rhs,
             n,
-            dummy_solution_values,
+            factor->device_dummy_solution,
             CUDSS_R_32F,
             CUDSS_LAYOUT_COL_MAJOR),
          error_message,
@@ -475,8 +566,8 @@ int aospectrum_cudss_shift_factor_create(
             factor->config,
             factor->data,
             factor->matrix,
-            dummy_solution,
-            dummy_rhs),
+            factor->dummy_solution,
+            factor->dummy_rhs),
          error_message,
          error_capacity,
          "cuDSS symbolic analysis") ||
@@ -525,104 +616,51 @@ int aospectrum_cudss_shift_factor_create(
    factor->stats.peak_host_bytes =
       memory_estimates[3] > 0 ? (uint64_t)memory_estimates[3] : 0;
 
-   started = monotonic_seconds();
-   if (check_cudss(
-         cudssExecute(
-            factor->handle,
-            CUDSS_PHASE_FACTORIZATION,
-            factor->config,
-            factor->data,
-            factor->matrix,
-            dummy_solution,
-            dummy_rhs),
-         error_message,
-         error_capacity,
-         "cuDSS numerical factorization") ||
-       check_cuda(
-         cudaStreamSynchronize(stream),
-         error_message,
-         error_capacity,
-         "cuDSS factorization synchronization") ||
-       query_data_info(
-         factor,
-         error_message,
-         error_capacity,
-         "cuDSS factorization")) {
+   if (factorize_current_values(factor, error_message, error_capacity)) {
       goto cleanup;
    }
-   factor->stats.factorization_seconds = monotonic_seconds() - started;
-
-   int64_t factor_nnz = 0;
-   int32_t pivot_count = 0;
-   int32_t inertia[2] = {0, 0};
-   if (check_cudss(
-         cudssDataGet(
-            factor->handle,
-            factor->data,
-            CUDSS_DATA_LU_NNZ,
-            &factor_nnz,
-            sizeof(factor_nnz),
-            &bytes_written),
-         error_message,
-         error_capacity,
-         "cuDSS factor-nnz query") ||
-       check_cudss(
-         cudssDataGet(
-            factor->handle,
-            factor->data,
-            CUDSS_DATA_NPIVOTS,
-            &pivot_count,
-            sizeof(pivot_count),
-            &bytes_written),
-         error_message,
-         error_capacity,
-         "cuDSS pivot-count query") ||
-       check_cudss(
-         cudssDataGet(
-            factor->handle,
-            factor->data,
-            CUDSS_DATA_INERTIA,
-            inertia,
-            sizeof(inertia),
-            &bytes_written),
-         error_message,
-         error_capacity,
-         "cuDSS inertia query")) {
-      goto cleanup;
-   }
-   factor->stats.factor_nnz = factor_nnz;
-   factor->stats.pivot_count = pivot_count;
-   factor->stats.inertia_positive = inertia[0];
-   factor->stats.inertia_negative = inertia[1];
-
-   if (check_cuda(
-         cudaMemGetInfo(&free_bytes, &total_bytes),
-         error_message,
-         error_capacity,
-         "cudaMemGetInfo after factorization")) {
-      goto cleanup;
-   }
-   factor->stats.free_device_bytes_after_factorization = free_bytes;
    *factor_output = factor;
    factor = NULL;
    return_code = 0;
 
 cleanup:
-   if (dummy_solution != NULL) {
-      cudssMatrixDestroy(dummy_solution);
-   }
-   if (dummy_rhs != NULL) {
-      cudssMatrixDestroy(dummy_rhs);
-   }
-   cudaFree(dummy_solution_values);
-   cudaFree(dummy_rhs_values);
-   free(host_values);
+   free(host_source_positions);
    free(host_indices);
    free(host_indptr);
    if (factor != NULL) {
       aospectrum_cudss_shift_factor_destroy(factor);
    }
    return return_code;
+}
+
+int aospectrum_cudss_shift_factor_refactor_device(
+      aospectrum_cudss_shift_factor *factor,
+      const float *device_hamiltonian_values,
+      const float *device_overlap_values,
+      float shift_hartree,
+      char *error_message,
+      size_t error_capacity) {
+   if (factor == NULL || device_hamiltonian_values == NULL ||
+         device_overlap_values == NULL || !isfinite(shift_hartree)) {
+      set_error(error_message, error_capacity, "invalid refactor request");
+      return 1;
+   }
+   factor->stats.preparation_seconds = 0.0;
+   factor->stats.upload_seconds = 0.0;
+   factor->stats.analysis_seconds = 0.0;
+   if (aospectrum_cuda_gather_shifted_real32(
+         device_hamiltonian_values,
+         device_overlap_values,
+         factor->device_source_positions,
+         factor->stats.upper_nnz,
+         shift_hartree,
+         factor->device_values,
+         factor->stream,
+         error_message,
+         error_capacity)) {
+      return 1;
+   }
+   return factorize_current_values(factor, error_message, error_capacity);
 }
 
 int aospectrum_cudss_shift_factor_solve(
@@ -730,6 +768,12 @@ void aospectrum_cudss_shift_factor_destroy(
    if (factor == NULL) {
       return;
    }
+   if (factor->dummy_solution != NULL) {
+      cudssMatrixDestroy(factor->dummy_solution);
+   }
+   if (factor->dummy_rhs != NULL) {
+      cudssMatrixDestroy(factor->dummy_rhs);
+   }
    if (factor->matrix != NULL) {
       cudssMatrixDestroy(factor->matrix);
    }
@@ -742,7 +786,10 @@ void aospectrum_cudss_shift_factor_destroy(
    if (factor->handle != NULL) {
       cudssDestroy(factor->handle);
    }
+   cudaFree(factor->device_dummy_solution);
+   cudaFree(factor->device_dummy_rhs);
    cudaFree(factor->device_values);
+   cudaFree(factor->device_source_positions);
    cudaFree(factor->device_indices);
    cudaFree(factor->device_indptr);
    free(factor);

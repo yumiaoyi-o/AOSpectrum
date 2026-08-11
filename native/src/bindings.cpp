@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <complex>
 #include <cstdint>
 #include <cstring>
@@ -33,6 +34,11 @@ struct NumericUpdateResult {
   int zero;
   int above;
   std::uint64_t numeric_epoch;
+  py::dict stage_seconds;
+  py::dict details;
+};
+
+struct DeviceValuesResult {
   py::dict stage_seconds;
   py::dict details;
 };
@@ -342,6 +348,91 @@ class PrimmeStateSession {
     return result;
   }
 
+  DeviceValuesResult load_device_values(
+      std::uintptr_t hamiltonian_pointer,
+      std::uintptr_t overlap_pointer,
+      std::int64_t nnz,
+      std::uintptr_t producer_stream,
+      double hamiltonian_scale_to_ev) {
+    require_open();
+    if (hamiltonian_pointer == 0 || overlap_pointer == 0 ||
+        nnz != static_cast<std::int64_t>(indices_.size()) ||
+        !std::isfinite(hamiltonian_scale_to_ev) ||
+        hamiltonian_scale_to_ev <= 0.0) {
+      throw std::invalid_argument(
+          "device H/S values differ from the PRIMME CSR contract");
+    }
+    aospectrum_primme_cuda_device_values_request_v1 request{};
+    request.abi_version = AOSPECTRUM_PRIMME_CUDA_ABI_VERSION;
+    request.struct_size = sizeof(request);
+    request.device_hamiltonian_values =
+        reinterpret_cast<const float *>(hamiltonian_pointer);
+    request.device_overlap_values =
+        reinterpret_cast<const float *>(overlap_pointer);
+    request.producer_stream = producer_stream;
+    request.hamiltonian_scale_to_hartree = static_cast<float>(
+        hamiltonian_scale_to_ev / kHartreeToEv);
+    aospectrum_primme_cuda_result_v1 native{};
+    int status;
+    {
+      py::gil_scoped_release release;
+      status =
+          aospectrum_primme_cuda_real32_session_load_device_values_v1(
+              session_, &request, &native);
+    }
+    require_primme_success(status, native, "device-value admission");
+    DeviceValuesResult result{py::dict(), py::dict()};
+    result.stage_seconds["device_admission"] = native.upload_seconds;
+    result.details["static_device_bytes"] = native.static_device_bytes;
+    return result;
+  }
+
+  NumericUpdateResult factor_resident(double shift_ev) {
+    require_open();
+    if (!std::isfinite(shift_ev)) {
+      throw std::invalid_argument("resident factor shift is invalid");
+    }
+    const float shift_hartree =
+        static_cast<float>(shift_ev / kHartreeToEv);
+    aospectrum_primme_cuda_resident_factor_request_v1 request{};
+    request.abi_version = AOSPECTRUM_PRIMME_CUDA_ABI_VERSION;
+    request.struct_size = sizeof(request);
+    request.target_shift_hartree = shift_hartree;
+    request.preconditioner_kind =
+        AOSPECTRUM_PRIMME_PRECONDITIONER_CUDSS_SHIFT;
+    request.diagonal_floor_hartree = 0.0F;
+    request.maximum_preconditioner_block_size = 8;
+    aospectrum_primme_cuda_result_v1 native{};
+    int status;
+    {
+      py::gil_scoped_release release;
+      status = aospectrum_primme_cuda_real32_session_factor_resident_v1(
+          session_, &request, &native);
+    }
+    require_primme_success(status, native, "resident factorization");
+    numeric_epoch_ = native.numeric_epoch;
+    shift_hartree_ = shift_hartree;
+    const int below = native.cudss_inertia_negative;
+    const int above = native.cudss_inertia_positive;
+    const int zero = static_cast<int>(n_) - below - above;
+    if (below < 0 || above < 0 || zero < 0) {
+      throw std::runtime_error("cuDSS inertia counts are invalid");
+    }
+    NumericUpdateResult result{
+        below, zero, above, native.numeric_epoch, py::dict(), py::dict()};
+    result.stage_seconds["device_value_prepare"] =
+        native.cudss_preparation_seconds;
+    result.stage_seconds["cudss_analysis"] = native.cudss_analysis_seconds;
+    result.stage_seconds["cudss_factorization"] =
+        native.cudss_factorization_seconds;
+    result.details["factor_nnz"] = native.cudss_factor_nnz;
+    result.details["pivot_count"] = native.cudss_pivot_count;
+    result.details["peak_device_bytes"] = native.cudss_peak_device_bytes;
+    result.details["analysis_reused"] =
+        native.cudss_analysis_seconds == 0.0;
+    return result;
+  }
+
   PrimmeSolveResult solve(
       const std::string &target,
       int count,
@@ -349,7 +440,8 @@ class PrimmeStateSession {
       std::int64_t max_matvecs,
       int max_basis_size,
       int min_restart_size,
-      int max_block_size) {
+      int max_block_size,
+      const py::object &initial_vectors_source) {
     require_open();
     if (numeric_epoch_ == 0 || count <= 0 || count >= n_) {
       throw std::invalid_argument("PRIMME solve state/count is invalid");
@@ -366,6 +458,21 @@ class PrimmeStateSession {
     std::vector<float> residuals(static_cast<std::size_t>(count));
     std::vector<float> eigenvectors(
         static_cast<std::size_t>(n_ * count));
+    using FortranFloatArray = py::array_t<
+        float,
+        py::array::f_style | py::array::forcecast>;
+    FortranFloatArray initial_vectors;
+    int initial_size = 0;
+    if (!initial_vectors_source.is_none()) {
+      initial_vectors = FortranFloatArray(initial_vectors_source);
+      if (initial_vectors.ndim() != 2 || initial_vectors.shape(0) != n_ ||
+          initial_vectors.shape(1) <= 0 ||
+          initial_vectors.shape(1) > count) {
+        throw std::invalid_argument(
+            "PRIMME initial vectors must have shape (n, 1:count)");
+      }
+      initial_size = static_cast<int>(initial_vectors.shape(1));
+    }
     aospectrum_primme_cuda_solve_request_v1 request{};
     request.abi_version = AOSPECTRUM_PRIMME_CUDA_ABI_VERSION;
     request.struct_size = sizeof(request);
@@ -378,8 +485,9 @@ class PrimmeStateSession {
     request.max_basis_size = max_basis_size;
     request.min_restart_size = min_restart_size;
     request.max_block_size = max_block_size;
-    request.init_size = 0;
-    request.initial_vectors = nullptr;
+    request.init_size = initial_size;
+    request.initial_vectors =
+        initial_size > 0 ? initial_vectors.data() : nullptr;
     request.return_vectors = 1;
     request.print_level = 0;
     aospectrum_primme_cuda_result_v1 native{};
@@ -409,10 +517,13 @@ class PrimmeStateSession {
     });
     py::array_t<float> energies({count});
     py::array_t<float> vectors({n_, static_cast<std::int64_t>(count)});
+    std::vector<float> ordered_residuals(static_cast<std::size_t>(count));
     auto energy_view = energies.mutable_unchecked<1>();
     auto vector_view = vectors.mutable_unchecked<2>();
     for (int column = 0; column < count; ++column) {
       const int source_column = order[static_cast<std::size_t>(column)];
+      ordered_residuals[static_cast<std::size_t>(column)] =
+          residuals[static_cast<std::size_t>(source_column)];
       energy_view(column) =
           eigenvalues[static_cast<std::size_t>(source_column)] *
           static_cast<float>(kHartreeToEv);
@@ -438,7 +549,7 @@ class PrimmeStateSession {
     result.counters["preconditions"] = native.preconditions;
     result.counters["restarts"] = native.restarts;
     result.details["factor_reused"] = native.factor_reused;
-    result.details["residual_norms_hartree"] = residuals;
+    result.details["residual_norms_hartree"] = ordered_residuals;
     result.details["peak_device_bytes"] = native.cudss_peak_device_bytes;
     return result;
   }
@@ -500,6 +611,10 @@ PYBIND11_MODULE(_aospectrum_cuda, module) {
       .def_readonly("stage_seconds", &NumericUpdateResult::stage_seconds)
       .def_readonly("details", &NumericUpdateResult::details);
 
+  py::class_<DeviceValuesResult>(module, "DeviceValuesResult")
+      .def_readonly("stage_seconds", &DeviceValuesResult::stage_seconds)
+      .def_readonly("details", &DeviceValuesResult::details);
+
   py::class_<PrimmeSolveResult>(module, "PrimmeSolveResult")
       .def_readonly("target_shift_ev", &PrimmeSolveResult::target_shift_ev)
       .def_readonly("energies_ev", &PrimmeSolveResult::energies_ev)
@@ -524,6 +639,18 @@ PYBIND11_MODULE(_aospectrum_cuda, module) {
            std::int64_t,
            const std::string &>())
       .def("update_numeric", &PrimmeStateSession::update_numeric)
-      .def("solve", &PrimmeStateSession::solve)
+      .def("load_device_values", &PrimmeStateSession::load_device_values)
+      .def("factor_resident", &PrimmeStateSession::factor_resident)
+      .def(
+          "solve",
+          &PrimmeStateSession::solve,
+          py::arg("target"),
+          py::arg("count"),
+          py::arg("tolerance"),
+          py::arg("max_matvecs"),
+          py::arg("max_basis_size"),
+          py::arg("min_restart_size"),
+          py::arg("max_block_size"),
+          py::arg("initial_vectors") = py::none())
       .def("close", &PrimmeStateSession::close);
 }

@@ -40,6 +40,7 @@ typedef struct {
 struct aospectrum_primme_cuda_real32_session_v1 {
    int64_t n;
    int64_t nnz;
+   int device_ordinal;
    int32_t *host_indptr;
    int32_t *host_indices;
    int32_t *device_indptr;
@@ -61,7 +62,10 @@ struct aospectrum_primme_cuda_real32_session_v1 {
    float target_shift_hartree;
    float diagonal_floor_hartree;
    int32_t maximum_preconditioner_block_size;
+   int32_t factor_maximum_rhs;
    int32_t preconditioner_kind;
+   uint64_t values_epoch;
+   int values_ready;
    int numeric_ready;
 };
 
@@ -147,6 +151,47 @@ static int check_cusparse_v1(
       operation,
       (int)status);
    return 1;
+}
+
+static int require_device_pointer_v1(
+      const void *pointer,
+      int expected_device,
+      aospectrum_primme_cuda_result_v1 *result,
+      const char *name) {
+   struct cudaPointerAttributes attributes;
+   if (pointer == NULL) {
+      set_error_v1(result, 12, "%s device pointer is null", name);
+      return 1;
+   }
+   const cudaError_t status = cudaPointerGetAttributes(&attributes, pointer);
+   if (status != cudaSuccess) {
+      set_error_v1(
+         result,
+         20,
+         "%s pointer is not CUDA-visible: %s",
+         name,
+         cudaGetErrorString(status));
+      return 1;
+   }
+#if CUDART_VERSION >= 10000
+   if (attributes.type != cudaMemoryTypeDevice &&
+         attributes.type != cudaMemoryTypeManaged) {
+      set_error_v1(result, 12, "%s pointer is not device memory", name);
+      return 1;
+   }
+   if (attributes.type == cudaMemoryTypeDevice &&
+         attributes.device != expected_device) {
+      set_error_v1(result, 12, "%s pointer belongs to another GPU", name);
+      return 1;
+   }
+#else
+   if (attributes.memoryType != cudaMemoryTypeDevice ||
+         attributes.device != expected_device) {
+      set_error_v1(result, 12, "%s pointer belongs to another GPU", name);
+      return 1;
+   }
+#endif
+   return 0;
 }
 
 static uint64_t session_static_device_bytes(
@@ -509,15 +554,10 @@ static int build_inverse_diagonal(
    return 0;
 }
 
-static void invalidate_numeric_state(
+static void clear_numeric_commit(
       aospectrum_primme_cuda_real32_session_v1 *session) {
    if (session == NULL) {
       return;
-   }
-   if (session->cudss_preconditioner.factor != NULL) {
-      aospectrum_cudss_shift_factor_destroy(
-         session->cudss_preconditioner.factor);
-      session->cudss_preconditioner.factor = NULL;
    }
    if (session->device_inverse_diagonal != NULL) {
       cudaFree(session->device_inverse_diagonal);
@@ -533,6 +573,21 @@ static void invalidate_numeric_state(
    session->numeric_ready = 0;
    session->cudss_preconditioner.last_error = 0;
    session->cudss_preconditioner.error_message[0] = '\0';
+}
+
+static void invalidate_numeric_state(
+      aospectrum_primme_cuda_real32_session_v1 *session) {
+   if (session == NULL) {
+      return;
+   }
+   clear_numeric_commit(session);
+   if (session->cudss_preconditioner.factor != NULL) {
+      aospectrum_cudss_shift_factor_destroy(
+         session->cudss_preconditioner.factor);
+      session->cudss_preconditioner.factor = NULL;
+   }
+   session->factor_maximum_rhs = 0;
+   session->values_ready = 0;
 }
 
 void aospectrum_primme_cuda_real32_session_destroy_v1(
@@ -618,6 +673,12 @@ int aospectrum_primme_cuda_real32_session_create_v1(
    session->n = request->n;
    session->nnz = request->nnz;
    session->target_shift_hartree = NAN;
+   if (check_cuda_v1(
+         cudaGetDevice(&session->device_ordinal),
+         result,
+         "cudaGetDevice")) {
+      goto cleanup;
+   }
    session->host_indptr = (int32_t *)malloc(
       ((size_t)request->n + 1u) * sizeof(int32_t));
    session->host_indices = (int32_t *)malloc(
@@ -903,14 +964,14 @@ int aospectrum_primme_cuda_real32_session_update_v1(
    else if (request->preconditioner_kind ==
          AOSPECTRUM_PRIMME_PRECONDITIONER_CUDSS_SHIFT) {
       char factor_error[AOSPECTRUM_PRIMME_CUDA_ERROR_CAPACITY] = {0};
-      if (aospectrum_cudss_shift_factor_create(
+      if (aospectrum_cudss_shift_factor_create_device(
             &session->cudss_preconditioner.factor,
             session->n,
             session->nnz,
             session->host_indptr,
             session->host_indices,
-            request->hamiltonian_values,
-            request->overlap_values,
+            session->device_hamiltonian,
+            session->device_overlap,
             request->target_shift_hartree,
             request->maximum_preconditioner_block_size,
             session->stream,
@@ -923,10 +984,14 @@ int aospectrum_primme_cuda_real32_session_update_v1(
             factor_error);
          goto cleanup;
       }
+      session->factor_maximum_rhs =
+         request->maximum_preconditioner_block_size;
    }
    result->upload_seconds = monotonic_seconds() - started;
 
    session->numeric_epoch += 1u;
+   session->values_epoch += 1u;
+   session->values_ready = 1;
    session->preconditioner_kind = request->preconditioner_kind;
    session->target_shift_hartree = request->target_shift_hartree;
    session->diagonal_floor_hartree = request->diagonal_floor_hartree;
@@ -955,6 +1020,250 @@ cleanup:
       fill_session_metadata(session, result);
    }
    free(host_inverse_diagonal);
+   return return_code;
+}
+
+int aospectrum_primme_cuda_real32_session_load_device_values_v1(
+      aospectrum_primme_cuda_real32_session_v1 *session,
+      const aospectrum_primme_cuda_device_values_request_v1 *request,
+      aospectrum_primme_cuda_result_v1 *result) {
+   int return_code = 1;
+   cudaEvent_t producer_ready = NULL;
+
+   if (result == NULL) {
+      return 1;
+   }
+   initialize_result_v1(result);
+   if (session == NULL || request == NULL) {
+      set_error_v1(result, 10, "device-value session or request is null");
+      return 1;
+   }
+   fill_session_metadata(session, result);
+   if (request->abi_version != AOSPECTRUM_PRIMME_CUDA_ABI_VERSION ||
+         request->struct_size != sizeof(*request)) {
+      set_error_v1(result, 10, "device-value request ABI mismatch");
+      return 1;
+   }
+   if (!isfinite(request->hamiltonian_scale_to_hartree) ||
+         request->hamiltonian_scale_to_hartree <= 0.0f) {
+      set_error_v1(result, 14, "Hamiltonian device scale is invalid");
+      return 1;
+   }
+   if (session->values_epoch == UINT64_MAX) {
+      set_error_v1(result, 19, "device-value epoch is exhausted");
+      return 1;
+   }
+   if (require_device_pointer_v1(
+         request->device_hamiltonian_values,
+         session->device_ordinal,
+         result,
+         "Hamiltonian") ||
+       require_device_pointer_v1(
+         request->device_overlap_values,
+         session->device_ordinal,
+         result,
+         "overlap")) {
+      return 1;
+   }
+   if (check_cuda_v1(
+         cudaStreamSynchronize(session->stream),
+         result,
+         "cudaStreamSynchronize(before device admission)")) {
+      invalidate_numeric_state(session);
+      fill_session_metadata(session, result);
+      return 1;
+   }
+   clear_numeric_commit(session);
+
+   const double started = monotonic_seconds();
+   const cudaStream_t producer_stream =
+      (cudaStream_t)request->producer_stream;
+   if (check_cuda_v1(
+         cudaEventCreateWithFlags(&producer_ready, cudaEventDisableTiming),
+         result,
+         "cudaEventCreate(device admission)") ||
+       check_cuda_v1(
+         cudaEventRecord(producer_ready, producer_stream),
+         result,
+         "cudaEventRecord(producer stream)") ||
+       check_cuda_v1(
+         cudaStreamWaitEvent(session->stream, producer_ready, 0),
+         result,
+         "cudaStreamWaitEvent(device admission)") ||
+       check_cuda_v1(
+         cudaMemcpyAsync(
+            session->device_hamiltonian,
+            request->device_hamiltonian_values,
+            (size_t)session->nnz * sizeof(float),
+            cudaMemcpyDeviceToDevice,
+            session->stream),
+         result,
+         "cudaMemcpyAsync(H device values)") ||
+       check_cuda_v1(
+         cudaMemcpyAsync(
+            session->device_overlap,
+            request->device_overlap_values,
+            (size_t)session->nnz * sizeof(float),
+            cudaMemcpyDeviceToDevice,
+            session->stream),
+         result,
+         "cudaMemcpyAsync(S device values)") ||
+       check_cublas_v1(
+         cublasSscal(
+            session->cublas_handle,
+            (int)session->nnz,
+            &request->hamiltonian_scale_to_hartree,
+            session->device_hamiltonian,
+            1),
+         result,
+         "cublasSscal(H device values)") ||
+       check_cuda_v1(
+         cudaStreamSynchronize(session->stream),
+         result,
+         "cudaStreamSynchronize(device admission)")) {
+      goto cleanup;
+   }
+   session->values_epoch += 1u;
+   session->values_ready = 1;
+   result->upload_seconds = monotonic_seconds() - started;
+   result->status = 0;
+   result->error_message[0] = '\0';
+   fill_session_metadata(session, result);
+   return_code = 0;
+
+cleanup:
+   if (producer_ready != NULL) {
+      cudaEventDestroy(producer_ready);
+   }
+   if (return_code != 0) {
+      cudaStreamSynchronize(session->stream);
+      invalidate_numeric_state(session);
+      fill_session_metadata(session, result);
+   }
+   return return_code;
+}
+
+int aospectrum_primme_cuda_real32_session_factor_resident_v1(
+      aospectrum_primme_cuda_real32_session_v1 *session,
+      const aospectrum_primme_cuda_resident_factor_request_v1 *request,
+      aospectrum_primme_cuda_result_v1 *result) {
+   int return_code = 1;
+   int reuse_analysis = 0;
+   char factor_error[AOSPECTRUM_PRIMME_CUDA_ERROR_CAPACITY] = {0};
+
+   if (result == NULL) {
+      return 1;
+   }
+   initialize_result_v1(result);
+   if (session == NULL || request == NULL) {
+      set_error_v1(result, 10, "resident-factor session or request is null");
+      return 1;
+   }
+   fill_session_metadata(session, result);
+   if (request->abi_version != AOSPECTRUM_PRIMME_CUDA_ABI_VERSION ||
+         request->struct_size != sizeof(*request)) {
+      set_error_v1(result, 10, "resident-factor request ABI mismatch");
+      return 1;
+   }
+   if (!session->values_ready) {
+      set_error_v1(result, 18, "resident H/S values are not ready");
+      return 1;
+   }
+   if (!isfinite(request->target_shift_hartree)) {
+      set_error_v1(result, 14, "resident factor shift is invalid");
+      return 1;
+   }
+   if (request->preconditioner_kind !=
+         AOSPECTRUM_PRIMME_PRECONDITIONER_CUDSS_SHIFT ||
+       request->maximum_preconditioner_block_size <= 0 ||
+       request->maximum_preconditioner_block_size > 256) {
+      set_error_v1(
+         result,
+         18,
+         "resident device path requires a valid cuDSS block size");
+      return 1;
+   }
+   if (session->numeric_epoch == UINT64_MAX) {
+      set_error_v1(result, 19, "numeric epoch is exhausted");
+      return 1;
+   }
+
+   reuse_analysis =
+      session->cudss_preconditioner.factor != NULL &&
+      session->factor_maximum_rhs ==
+         request->maximum_preconditioner_block_size;
+   clear_numeric_commit(session);
+   if (!reuse_analysis && session->cudss_preconditioner.factor != NULL) {
+      aospectrum_cudss_shift_factor_destroy(
+         session->cudss_preconditioner.factor);
+      session->cudss_preconditioner.factor = NULL;
+      session->factor_maximum_rhs = 0;
+   }
+
+   if (reuse_analysis) {
+      if (aospectrum_cudss_shift_factor_refactor_device(
+            session->cudss_preconditioner.factor,
+            session->device_hamiltonian,
+            session->device_overlap,
+            request->target_shift_hartree,
+            factor_error,
+            sizeof(factor_error))) {
+         set_error_v1(
+            result,
+            32,
+            "cuDSS shift refactor failed: %s",
+            factor_error);
+         goto cleanup;
+      }
+   }
+   else if (aospectrum_cudss_shift_factor_create_device(
+         &session->cudss_preconditioner.factor,
+         session->n,
+         session->nnz,
+         session->host_indptr,
+         session->host_indices,
+         session->device_hamiltonian,
+         session->device_overlap,
+         request->target_shift_hartree,
+         request->maximum_preconditioner_block_size,
+         session->stream,
+         factor_error,
+         sizeof(factor_error))) {
+      set_error_v1(
+         result,
+         32,
+         "cuDSS shift factor failed: %s",
+         factor_error);
+      goto cleanup;
+   }
+
+   session->factor_maximum_rhs =
+      request->maximum_preconditioner_block_size;
+   session->numeric_epoch += 1u;
+   session->preconditioner_kind = request->preconditioner_kind;
+   session->target_shift_hartree = request->target_shift_hartree;
+   session->diagonal_floor_hartree = request->diagonal_floor_hartree;
+   session->maximum_preconditioner_block_size =
+      request->maximum_preconditioner_block_size;
+   session->numeric_ready = 1;
+   session->factor_numeric_epoch = session->numeric_epoch;
+   result->status = 0;
+   result->error_message[0] = '\0';
+   fill_session_metadata(session, result);
+   record_session_cudss_stats(session, result);
+   return_code = 0;
+
+cleanup:
+   if (return_code != 0) {
+      clear_numeric_commit(session);
+      if (session->cudss_preconditioner.factor != NULL) {
+         aospectrum_cudss_shift_factor_destroy(
+            session->cudss_preconditioner.factor);
+         session->cudss_preconditioner.factor = NULL;
+      }
+      session->factor_maximum_rhs = 0;
+      fill_session_metadata(session, result);
+   }
    return return_code;
 }
 

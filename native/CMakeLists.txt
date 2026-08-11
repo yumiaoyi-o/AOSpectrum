@@ -37,6 +37,7 @@ pybind11_add_module(
   src/bindings.cpp
   src/aospectrum_cudss_complex64_ubatch.c
   src/aospectrum_cudss_shift_factor.c
+  src/aospectrum_cuda_ops.cu
   src/aospectrum_primme_cuda.c
 )
 target_compile_features(_aospectrum_cuda PRIVATE cxx_std_17)
@@ -61,6 +62,8 @@ target_link_libraries(
 set_target_properties(
   _aospectrum_cuda
   PROPERTIES
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON
   C_VISIBILITY_PRESET hidden
   CXX_VISIBILITY_PRESET hidden
   VISIBILITY_INLINES_HIDDEN ON

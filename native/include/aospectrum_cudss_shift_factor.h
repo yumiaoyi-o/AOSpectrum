@@ -33,17 +33,25 @@ typedef struct {
    uint64_t free_device_bytes_after_factorization;
 } aospectrum_cudss_shift_factor_stats;
 
-int aospectrum_cudss_shift_factor_create(
+int aospectrum_cudss_shift_factor_create_device(
       aospectrum_cudss_shift_factor **factor,
       int64_t n,
       int64_t nnz,
       const int32_t *indptr,
       const int32_t *indices,
-      const float *hamiltonian_values,
-      const float *overlap_values,
+      const float *device_hamiltonian_values,
+      const float *device_overlap_values,
       float shift_hartree,
       int32_t maximum_rhs,
       cudaStream_t stream,
+      char *error_message,
+      size_t error_capacity);
+
+int aospectrum_cudss_shift_factor_refactor_device(
+      aospectrum_cudss_shift_factor *factor,
+      const float *device_hamiltonian_values,
+      const float *device_overlap_values,
+      float shift_hartree,
       char *error_message,
       size_t error_capacity);
 
